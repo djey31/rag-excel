@@ -109,7 +109,7 @@ def index_file(file_bytes, filename):
 
     from docling.document_converter import DocumentConverter
     from langchain_community.vectorstores import Chroma
-    from langchain.text_splitter import RecursiveCharacterTextSplitter
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
 
     with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
         tmp.write(file_bytes)
