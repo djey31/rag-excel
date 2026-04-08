@@ -1,0 +1,8 @@
+docling
+langchain
+langchain-community
+langchain-groq
+sentence-transformers
+chromadb
+streamlit
+openpyxl
