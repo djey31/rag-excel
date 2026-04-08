@@ -1,154 +1,120 @@
-import os
-import gc
-import tempfile
-import uuid
-import pandas as pd
 import streamlit as st
-
-from llama_index.core import Settings, PromptTemplate, VectorStoreIndex
-from llama_index.llms.ollama import Ollama
-from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-from llama_index.core import SimpleDirectoryReader
-from llama_index.readers.docling import DoclingReader
-from llama_index.core.node_parser import MarkdownNodeParser
+import os
+import tempfile
 
 # ------------------------------------------------------------
-# CONFIGURATION APP
+# CONFIG APP
 # ------------------------------------------------------------
 st.set_page_config(
-    page_title="Assistant Excel IA",
+    page_title="Excel AI",
     page_icon="📊",
     layout="wide"
 )
 
 # ------------------------------------------------------------
-# STYLE SIMPLE
+# SESSION STATE
 # ------------------------------------------------------------
-st.markdown("""
-<style>
-#MainMenu, footer, header {visibility: hidden;}
-
-.block-container {
-    padding-top: 2rem;
-}
-
-.stButton>button {
-    background-color: #00c781;
-    color: white;
-    border-radius: 8px;
-}
-</style>
-""", unsafe_allow_html=True)
+for k, v in {
+    "messages": [],
+    "vectorstore": None,
+    "qa_chain": None,
+    "indexed": False,
+    "file_info": {}
+}.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
 # ------------------------------------------------------------
-# SESSION
+# GROQ API KEY
 # ------------------------------------------------------------
-if "session_id" not in st.session_state:
-    st.session_state.session_id = str(uuid.uuid4())
-
-if "engine" not in st.session_state:
-    st.session_state.engine = None
-
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
+try:
+    GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
+except:
+    st.error("❌ Ajoute ta clé GROQ dans secrets")
+    st.stop()
 
 # ------------------------------------------------------------
-# MODELES (CACHE)
+# PARAMÈTRES CACHÉS (IMPORTANT 🔥)
+# ------------------------------------------------------------
+MODEL = "llama-3.3-70b-versatile"
+CHUNK_SIZE = 600
+CHUNK_OVERLAP = 80
+TOP_K = 5
+TEMPERATURE = 0.0
+
+# ------------------------------------------------------------
+# EMBEDDINGS
 # ------------------------------------------------------------
 @st.cache_resource
-def init_llm():
-    return Ollama(model="llama3.2", request_timeout=120.0)
-
-@st.cache_resource
-def init_embedding():
-    return HuggingFaceEmbedding(
-        model_name="BAAI/bge-large-en-v1.5",
-        trust_remote_code=True
+def get_embeddings():
+    from langchain_community.embeddings import HuggingFaceEmbeddings
+    return HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2"
     )
 
 # ------------------------------------------------------------
-# RESET
+# INDEXATION (DOC + CHUNKS + VECTOR DB)
 # ------------------------------------------------------------
-def reset():
-    st.session_state.chat_history = []
-    st.session_state.engine = None
-    gc.collect()
+def index_file(file_bytes, filename):
 
-# ------------------------------------------------------------
-# HEADER
-# ------------------------------------------------------------
-col1, col2 = st.columns([6,1])
+    from docling.document_converter import DocumentConverter
+    from langchain_community.vectorstores import Chroma
+    from langchain.text_splitter import RecursiveCharacterTextSplitter
 
-with col1:
-    st.markdown("""
-    <h2 style='text-align:center;'>📊 Assistant Excel IA</h2>
-    <p style='text-align:center; color:gray;'>
-    Uploadez votre fichier → Posez vos questions → Obtenez des insights
-    </p>
-    """, unsafe_allow_html=True)
+    # 1. Sauvegarde temporaire
+    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+        tmp.write(file_bytes)
+        tmp_path = tmp.name
 
-with col2:
-    st.button("Réinitialiser ↺", on_click=reset)
+    # 2. DOC LING (🔥 clé)
+    converter = DocumentConverter()
+    result = converter.convert(tmp_path)
 
-# ------------------------------------------------------------
-# SIDEBAR
-# ------------------------------------------------------------
-with st.sidebar:
+    # Excel → texte markdown
+    markdown = result.document.export_to_markdown()
 
-    st.markdown("## 📁 Importer un fichier Excel")
+    os.unlink(tmp_path)
 
-    uploaded_file = st.file_uploader(
-        "Glissez votre fichier ici",
-        type=["xlsx", "xls"]
+    # 3. SPLIT TEXTE
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+        separators=["\n\n", "\n", "|", " "]
     )
 
-    st.markdown("---")
+    chunks = splitter.split_text(markdown)
 
-    st.markdown("### 💡 Exemples de questions")
-    st.markdown("""
-    - Résume les données  
-    - Quelles sont les valeurs manquantes ?  
-    - Quelles sont les valeurs les plus élevées ?  
-    - Donne-moi des insights  
-    """)
+    # 4. EMBEDDINGS
+    embeddings = get_embeddings()
+
+    # 5. VECTOR STORE
+    vectorstore = Chroma.from_texts(
+        texts=chunks,
+        embedding=embeddings,
+        metadatas=[{"source": filename, "chunk": i} for i in range(len(chunks))]
+    )
+
+    return vectorstore, len(chunks), markdown
 
 # ------------------------------------------------------------
-# INDEXATION
+# QA CHAIN (LLM)
 # ------------------------------------------------------------
-def traiter_fichier(file):
+def build_chain(vectorstore):
 
-    with tempfile.TemporaryDirectory() as temp_dir:
-        path = os.path.join(temp_dir, file.name)
+    from langchain_groq import ChatGroq
+    from langchain.chains import RetrievalQA
+    from langchain.prompts import PromptTemplate
 
-        with open(path, "wb") as f:
-            f.write(file.getvalue())
+    llm = ChatGroq(
+        model=MODEL,
+        temperature=TEMPERATURE,
+        groq_api_key=GROQ_API_KEY
+    )
 
-        reader = DoclingReader()
+    retriever = vectorstore.as_retriever(search_kwargs={"k": TOP_K})
 
-        loader = SimpleDirectoryReader(
-            input_dir=temp_dir,
-            file_extractor={".xlsx": reader},
-        )
-
-        documents = loader.load_data()
-
-        # Initialisation modèles
-        Settings.llm = init_llm()
-        Settings.embed_model = init_embedding()
-
-        parser = MarkdownNodeParser()
-
-        index = VectorStoreIndex.from_documents(
-            documents,
-            transformations=[parser],
-            show_progress=True
-        )
-
-        query_engine = index.as_query_engine(streaming=True)
-
-        # Prompt optimisé métier
-        prompt = PromptTemplate(
-            """Tu es un data analyst expert.
+    prompt = PromptTemplate(
+        template="""Tu es un data analyst expert.
 
 Analyse les données Excel et réponds :
 
@@ -156,86 +122,88 @@ Analyse les données Excel et réponds :
 - avec des chiffres
 - avec des insights utiles
 
-Si l'information n'existe pas, dis :
+Si tu ne trouves pas, dis :
 "Je ne trouve pas cette information dans les données."
 
 Contexte :
-{context_str}
+{context}
 
 Question :
-{query_str}
+{question}
 
 Réponse :
-"""
-        )
+""",
+        input_variables=["context", "question"]
+    )
 
-        query_engine.update_prompts({
-            "response_synthesizer:text_qa_template": prompt
-        })
-
-        return query_engine
-
-# ------------------------------------------------------------
-# PREVIEW
-# ------------------------------------------------------------
-def afficher_apercu(file):
-    df = pd.read_excel(file)
-    st.markdown("### 👀 Aperçu des données")
-    st.dataframe(df.head(50))
+    return RetrievalQA.from_chain_type(
+        llm=llm,
+        retriever=retriever,
+        chain_type="stuff",
+        chain_type_kwargs={"prompt": prompt},
+        return_source_documents=True,
+    )
 
 # ------------------------------------------------------------
-# TRAITEMENT FICHIER
+# SIDEBAR
 # ------------------------------------------------------------
-if uploaded_file:
+with st.sidebar:
 
-    if st.session_state.engine is None:
+    st.markdown("## 📁 Upload Excel")
 
-        with st.spinner("⚡ Analyse du fichier en cours..."):
-            try:
-                st.session_state.engine = traiter_fichier(uploaded_file)
-                st.success("✅ Fichier prêt ! Posez vos questions.")
-            except Exception as e:
-                st.error(f"Erreur : {e}")
-                st.stop()
+    uploaded = st.file_uploader("Fichier", type=["xlsx", "xls"])
 
-    afficher_apercu(uploaded_file)
+    st.markdown("⚙️ Paramètres optimisés automatiquement")
+
+    index_btn = st.button("Analyser")
+
+# ------------------------------------------------------------
+# MAIN UI
+# ------------------------------------------------------------
+st.title("📊 Excel AI Assistant")
+
+if index_btn:
+
+    if not uploaded:
+        st.error("Upload un fichier")
+    else:
+        with st.spinner("Analyse en cours..."):
+
+            vs, n, md = index_file(uploaded.getvalue(), uploaded.name)
+
+            st.session_state.vectorstore = vs
+            st.session_state.qa_chain = build_chain(vs)
+            st.session_state.indexed = True
+
+            st.success(f"✅ {n} morceaux analysés")
 
 # ------------------------------------------------------------
 # CHAT
 # ------------------------------------------------------------
-for msg in st.session_state.chat_history:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
+if st.session_state.indexed:
 
-question = st.chat_input("Posez votre question sur les données...")
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
 
-if question:
+    question = st.chat_input("Pose ta question...")
 
-    st.session_state.chat_history.append({
-        "role": "user",
-        "content": question
-    })
+    if question:
 
-    with st.chat_message("user"):
-        st.markdown(question)
+        st.session_state.messages.append({"role": "user", "content": question})
 
-    with st.chat_message("assistant"):
+        with st.chat_message("user"):
+            st.markdown(question)
 
-        if st.session_state.engine is None:
-            st.error("Veuillez importer un fichier Excel.")
-        else:
-            zone_reponse = st.empty()
-            reponse_complete = ""
+        with st.chat_message("assistant"):
 
-            stream = st.session_state.engine.query(question)
+            res = st.session_state.qa_chain.invoke({"query": question})
 
-            for chunk in stream.response_gen:
-                reponse_complete += chunk
-                zone_reponse.markdown(reponse_complete + "▌")
+            answer = res["result"]
 
-            zone_reponse.markdown(reponse_complete)
+            st.markdown(answer)
 
-            st.session_state.chat_history.append({
+            st.session_state.messages.append({
                 "role": "assistant",
-                "content": reponse_complete
+                "content": answer
             })
